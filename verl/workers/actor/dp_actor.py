@@ -23,7 +23,6 @@ import os
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -38,18 +37,15 @@ from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pa
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
+import numpy as np
+from sklearn_extra.cluster import KMedoids
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from collections import defaultdict
+
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 elif is_npu_available:
-    try:
-        from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
-    except ImportError:
-        # Since transformers v4.55.1, index_first_axis, pad_input, and unpad_input
-        # have been consolidated into `transformers.modeling_flash_attention_utils`.
-        from einops import rearrange
-        from transformers.modeling_flash_attention_utils import _index_first_axis as index_first_axis
-        from transformers.modeling_flash_attention_utils import _pad_input as pad_input
-        from transformers.modeling_flash_attention_utils import _unpad_input as unpad_input
+    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
 
 __all__ = ["DataParallelPPOActor"]
@@ -107,9 +103,14 @@ class DataParallelPPOActor(BasePPOActor):
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
-            from verl.utils.model import extract_multi_modal_inputs
-
-            multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+            if "image_bound" in micro_batch["multi_modal_inputs"][0]:  # minicpm-o logic
+                for key in micro_batch["multi_modal_inputs"][0].keys():
+                    multi_modal_inputs[key] = [inputs[key] for inputs in micro_batch["multi_modal_inputs"]]
+            else:
+                for key in micro_batch["multi_modal_inputs"][0].keys():
+                    multi_modal_inputs[key] = torch.cat(
+                        [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
+                    )
 
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
@@ -118,7 +119,7 @@ class DataParallelPPOActor(BasePPOActor):
             position_ids = micro_batch["position_ids"]
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
-                position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+                position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
             if self.use_remove_padding:
                 input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
@@ -132,7 +133,7 @@ class DataParallelPPOActor(BasePPOActor):
                         index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
                         .transpose(0, 1)
                         .unsqueeze(1)
-                    )  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
+                    )  # (3, bsz, seqlen) -> (3, 1, bsz * seqlen)
                 else:
                     position_ids_rmpad = index_first_axis(
                         rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
@@ -150,9 +151,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
-                    is_vlm_model = hasattr(
-                        getattr(self.actor_module, "module", self.actor_module).config, "vision_config"
-                    )
+                    is_vlm_model = "multi_modal_inputs" in micro_batch.keys()
                     if is_vlm_model:
                         # vlm model's inputs will be sliced after embedding
                         input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
@@ -295,9 +294,6 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
 
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
-
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
@@ -404,7 +400,13 @@ class DataParallelPPOActor(BasePPOActor):
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+        print(f"### dp_actor.py, data size {len(data)}, mini_batches {len(mini_batches)}, on_policy {on_policy}")
 
+        # assert len(data) == 1
+        # assert self.config.ppo_mini_batch_size == 1
+
+        grad_norm = defaultdict(float)
+        grads_all, grads_last = [], []
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -416,6 +418,7 @@ class DataParallelPPOActor(BasePPOActor):
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                print(f"### dp_actor.py, micro_batches size {len(micro_batches)}")
 
                 self.actor_optimizer.zero_grad()
 
@@ -435,6 +438,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
+                    loss_scale_factor = 1
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
@@ -491,6 +495,19 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     loss.backward()
 
+                    grads_all.append({})
+                    grads_last.append({})
+                    with FSDP.summon_full_params(self.actor_module,
+                             writeback=False,
+                             rank0_only=True,
+                             with_grads=True):
+                        for name, param in self.actor_module.named_parameters():
+                            if param.grad is not None:
+                                grad_norm[name] += param.grad.abs().mean().item()
+                                grads_all[-1][name] = get_sparse_tensor(param.grad)
+                                if "model.layers.35" in name or "model.norm" in name:
+                                    grads_last[-1][name] = get_sparse_tensor(param.grad)
+
                     micro_batch_metrics.update(
                         {
                             "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
@@ -501,8 +518,70 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, mini_batch_metrics)
+                # grad_norm = self._optimizer_step()
+                # mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                # append_to_dict(metrics, mini_batch_metrics)
+        # calculate similarities
+        # breakpoint()
+        print(f"### grad accum: {grad_norm}")
+        distance_all = calc_distance(grads_all)
+        print(f"### distances -- all: {distance_all.tolist()}")
+        print(f"### kmedoids results -- all: {kmedoids_from_distance(distance_all)}")
+        distance_last = calc_distance(grads_last)
+        print(f"### distances -- last: {distance_last.tolist()}")
+        print(f"### kmedoids results -- last: {kmedoids_from_distance(distance_last)}")
+
         self.actor_optimizer.zero_grad()
         return metrics
+
+def kmedoids_from_distance(distance):
+    ret = {}
+    for n_clusters in range(1, 6):
+        kmed = KMedoids(
+            n_clusters=n_clusters,
+            metric="precomputed",
+            method="pam",
+            init="k-medoids++",
+        )
+        kmed.fit(distance)
+        labels = kmed.labels_
+        medoid_indices = kmed.medoid_indices_
+
+        dists = []
+        for c in range(n_clusters):
+            idx = np.where(labels == c)[0]
+            if idx.size <= 1:
+                dists.append(0.0)
+            else:
+                dists.append(distance[idx, medoid_indices[c]].sum() / (idx.size - 1))
+        ret[n_clusters] = np.mean(dists)
+    return ret
+
+def calc_distance(grads):
+    distance = np.zeros((len(grads), len(grads)))
+    for i in range(len(grads)):
+        for j in range(i+1, len(grads)):
+            distance[j,i] = distance[i,j] = calc_distance_each_pair(grads[i], grads[j])
+    return distance
+
+def calc_distance_each_pair(grad_a, grad_b):
+    dist = 0.0
+    for name, a in grad_a.items():
+        b = grad_b[name]
+        with torch.no_grad():
+            dist += (a.to_dense() - b.to_dense()).abs().sum().item()
+    return dist / len(grad_a.keys())
+
+def get_sparse_tensor(tensor):
+    if len(tensor.shape) == 1:
+        return tensor
+
+    k = (tensor.shape[0] // 10)
+    assert k > 0
+    _, indices = torch.topk(tensor.view(-1), k)
+    rows = indices // tensor.size(1)
+    cols = indices % tensor.size(1)
+
+    mask = torch.zeros_like(tensor, dtype=torch.bool)
+    mask[rows, cols] = 1
+    return (tensor * mask).to_sparse().detach()

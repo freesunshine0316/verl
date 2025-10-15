@@ -846,6 +846,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
+                print(f"### fsdp_workers.py size of batch: {len(data)}")
                 metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
