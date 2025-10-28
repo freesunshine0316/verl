@@ -39,12 +39,15 @@ Your output must be strictly **'YES'** or **'NO'**, with no additional words, pu
 **Output:**  
 '''
 
+TOPK = 200
+
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tp", default=4)
-    parser.add_argument("--every", default=10)
-    parser.add_argument("--temperature", default=0.6)
+    parser.add_argument("--tp", type=int, default=4)
+    parser.add_argument("--every", type=int, default=10)
+    parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--task", choices=["policy", "rm"], default="rm")
+    parser.add_argument("--query_path", default=POLICY_DATA_PATH)
     parser.add_argument("--out_dir", default="/apdcephfs_gy2/share_302625456/user/lfsong/rm_calib")
     parser.add_argument("--out_file", default="policy_samples")
     parser.add_argument("--sample_file", default="policy_samples_every10_temp0.0.json")
@@ -61,28 +64,55 @@ def last_non_empty_line(text):
 def prepare_data_rm(inpath, tokenizer, args):
     with open(inpath, "r") as fin:
         inputs = json.load(fin)
-    data = []
+    raw_data, data = [], []
     for i, inst in enumerate(inputs):
         response = last_non_empty_line(inst["text"])
         if not response:
             continue
-        prompt_question = RM_PROMPT.format(question=inst["query"][-1]["content"], 
-                reference=inst["label"],
+        raw_data.append(inst)
+
+        if "query" in inst:
+            question = inst["query"][-1]["content"]
+        elif "problem" in inst:
+            question = inst["problem"]
+
+        if "label" in inst:
+            reference = inst["label"]
+        elif "solution" in inst:
+            reference = inst["solution"]
+
+        prompt_question = RM_PROMPT.format(question=question, 
+                reference=reference,
                 response=response)
         messages=[
                   {"role": "system", "content": "You are a helpful assistant."},
                   {"role": "user", "content": prompt_question},
                 ]
         data.append(tokenizer.apply_chat_template(messages, tokenize=False))
-    return inputs, data
+    return raw_data, data
 
 def prepare_data_policy(inpath, tokenizer, args):
-    with open(inpath, "r") as fin:
-        inputs = json.load(fin)
+    try:
+        with open(inpath, "r") as fin:
+            inputs = json.load(fin)
+    except:
+        with open(inpath, "r") as fin:
+            inputs = [json.loads(line.strip()) for line in fin]
+
     data = []
     for i, inst in enumerate(inputs):
         if i % args.every == 0:
-            messages = inst["query"]
+            if "query" in inst:
+                messages = inst["query"]
+            elif "problem" in inst:
+                messages = inst["problem"]
+            if isinstance(messages, str):
+                messages = [{
+                    "content": "You are a chatbot who can solve problems. Please solve the following problem and give your thought process. Before giving the final result, you should output \"Therefore, the answer is\", and then give your final answer.",
+                    "role": "system"},{
+                    "content": messages,
+                    "role": "user"
+                }]
             data.append(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
     return inputs, data
 
@@ -141,7 +171,7 @@ args = get_args()
 if args.task == "policy":
     model_path = POLICY_PATH
     tokenizer = AutoTokenizer.from_pretrained(POLICY_PATH)
-    raw_data, data = prepare_data_policy(POLICY_DATA_PATH, tokenizer, args)
+    raw_data, data = prepare_data_policy(args.query_path, tokenizer, args)
 else:
     model_path = RM_PATH
     tokenizer = AutoTokenizer.from_pretrained(RM_PATH)
@@ -150,12 +180,13 @@ else:
 print(f"!!!!! read {len(data)} data, example: \n{data[0]}")
 
 sampling_params = SamplingParams(temperature=args.temperature, top_p=0.95, max_tokens=8096, 
-                                 logprobs=0 if args.task == "policy" else 20)
+                                 logprobs=0 if args.task == "policy" else TOPK)
 llm = LLM(
     model=model_path,
     tensor_parallel_size=args.tp,
     gpu_memory_utilization=0.85,
     trust_remote_code=True,  # safe for well-known repos; needed by some models
+    max_logprobs=TOPK,
 )
 output = llm.generate(data, sampling_params=sampling_params, use_tqdm=True)
 
@@ -172,6 +203,7 @@ else:
     output_dump = []
     for i, inst in enumerate(output):
         output_dump.append({"rm_prompt": data[i]})
-        output_dump[-1]["rm_score"] = get_rm_score(inst.outputs[0].logprobs[-2])
+        output_dump[-1].update(raw_data[i])
+        output_dump[-1]["rm_score"] = get_rm_score(inst.outputs[0].logprobs[-1])
 with open(out_path, "w") as fout:
     json.dump(output_dump, fout, ensure_ascii=False, indent=2)
