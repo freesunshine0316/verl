@@ -50,6 +50,7 @@ def get_args():
     parser.add_argument("--in_file", default="policy_samples_math_every1_temp0.0_rm_scores_with_label.json")
     parser.add_argument("--out_file", default="policy_samples_math_every1_temp0.0_rm_scores_with_label.json")
     parser.add_argument("--portion", default="")
+    parser.add_argument("--only_stat", action="store_true")
     args = parser.parse_args()
     return args
 
@@ -99,6 +100,8 @@ def generate(prompt):
             traceback.print_exc()
 
 def update_stat(rm_score, actual_score, confuse_matrix, bins):
+    if isinstance(actual_score, str):
+        actual_score = 1 if actual_score.lower() == "yes" else 0
     if rm_score == 0.0:
         if actual_score == 0:
             confuse_matrix["tn"] += 1
@@ -134,6 +137,8 @@ def main():
         reference = inst["label"] if "label" in inst else inst["solution"]
         if f"{args.method}_label" in inst:
             actual_score = inst[f"{args.method}_label"]
+        elif args.only_stat:
+            continue
         elif args.method == "gemini":
             actual_score = verify_solution(question, solution, reference)
         elif args.method == "rule":
@@ -146,6 +151,8 @@ def main():
             for i, item in enumerate(bins)]
     print(f"Bin stat for uncertain cases: {bins}")
     print(f"Confusion matrix for certain cases: {confuse_matrix}")
+    if args.only_stat:
+        return
 
     outpath = os.path.join(args.base_dir, args.out_file)
     if args.portion != "":
